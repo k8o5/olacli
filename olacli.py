@@ -5,9 +5,11 @@ import subprocess
 import json
 import re
 import argparse
+import base64  # For image encoding
+from typing import List, Dict
 
-def call_ollama_api_stream(messages, model="codellama"):
-    """Calls the Ollama API with a chat history and streams the response."""
+def call_ollama_api_stream(messages: List[Dict], model: str = "codellama", max_retries: int = 3) -> str:
+    """Calls the Ollama API with retries, streaming the response."""
     data = {
         "model": model,
         "messages": messages,
@@ -15,140 +17,206 @@ def call_ollama_api_stream(messages, model="codellama"):
     }
     url = "http://localhost:11434/api/chat"
     
+    for attempt in range(max_retries):
+        try:
+            with requests.post(url, json=data, stream=True, timeout=30) as response:
+                response.raise_for_status()
+                full_response = ""
+                for chunk in response.iter_lines():
+                    if chunk:
+                        decoded_chunk = chunk.decode('utf-8')
+                        json_chunk = json.loads(decoded_chunk)
+                        content = json_chunk.get("message", {}).get("content", "")
+                        full_response += content
+                        print(content, end="", flush=True)
+                return full_response
+        except requests.exceptions.RequestException as e:
+            print(f"\nError calling Ollama API (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                return None
+
+def encode_image(image_path: str) -> str:
+    """Encodes an image to base64 for vision models."""
     try:
-        with requests.post(url, json=data, stream=True) as response:
-            response.raise_for_status()
-            full_response = ""
-            for chunk in response.iter_lines():
-                if chunk:
-                    decoded_chunk = chunk.decode('utf-8')
-                    json_chunk = json.loads(decoded_chunk)
-                    content = json_chunk.get("message", {}).get("content", "")
-                    full_response += content
-                    print(content, end="", flush=True)
-            return full_response
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Ollama API: {e}")
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error encoding image: {e}")
         return None
 
-def extract_code_block(response_text):
+def extract_code_block(response_text: str) -> tuple:
     """Extracts a code block, its language, and an optional filename from the AI's response."""
     filename_match = re.search(r"filename: (.*?)\n", response_text)
     filename = filename_match.group(1).strip() if filename_match else None
 
     code_match = re.search(r"```(.*?)\n(.*?)```", response_text, re.DOTALL)
     if code_match:
-        language = code_match.group(1).strip()
+        language = code_match.group(1).strip().lower()
         code = code_match.group(2).strip()
         return filename, language, code
     return filename, None, None
 
+def save_history(messages: List[Dict], file_path: str = "chat_history.json"):
+    """Saves chat history to a file."""
+    try:
+        with open(file_path, "w") as f:
+            json.dump(messages, f, indent=4)
+        print(f"\nChat history saved to {file_path}")
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+def load_history(file_path: str = "chat_history.json") -> List[Dict]:
+    """Loads chat history from a file."""
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"Error loading history: {e}")
+        return []
+
 def main():
-    """Main function for the AI assistant."""
-    parser = argparse.ArgumentParser(description="Ollama CLI")
-    parser.add_argument("--model", default="codellama", help="The Ollama model to use.")
+    parser = argparse.ArgumentParser(description="Gemini-like CLI for Ollama: Interactive AI chat with code execution.")
+    parser.add_argument("--model", default="codellama", help="Ollama model to use (e.g., codellama, llava for vision).")
+    parser.add_argument("--prompt", help="One-shot prompt to send (non-interactive).")
+    parser.add_argument("--image", help="Path to an image file for vision models.")
+    parser.add_argument("--load-history", action="store_true", help="Load previous chat history.")
+    parser.add_argument("--save-history", action="store_true", help="Save chat history on exit.")
     args = parser.parse_args()
 
-    print(f"\nWelcome to your personal Ollama CLI! (Using model: {args.model})")
-    print("Type 'exit' or 'quit' to end the conversation.")
+    print(f"\nWelcome to Ollama CLI (Gemini-inspired)! Using model: {args.model}")
+    print("Type 'exit' or 'quit' to end. Use '/save' to save history, '/load' to load.")
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful assistant that can execute shell commands and write code. When asked to perform an action that requires a shell command, please respond with the command in a ```bash\n...``` block. When asked to write code, you can specify a filename with 'filename: path/to/file.ext' before the code block. Please respond with the code in a ```<language>\n...``` block."
-        }
-    ]
+    messages = [{
+        "role": "system",
+        "content": "You are a helpful assistant. Respond concisely. For shell commands, use ```bash blocks. For code, specify 'filename: path/to/file.ext' before ```language blocks."
+    }]
 
+    if args.load_history:
+        loaded = load_history()
+        if loaded:
+            messages.extend(loaded)
+            print("Loaded previous chat history.")
+
+    if args.prompt:  # One-shot mode
+        user_content = args.prompt
+        if args.image:
+            base64_image = encode_image(args.image)
+            if base64_image:
+                user_content += f"\n[Image attached: Analyze this image.]"
+                messages.append({"role": "user", "content": user_content, "images": [base64_image]})
+            else:
+                messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": user_content})
+        
+        print("\nAI: ", end="")
+        ai_response = call_ollama_api_stream(messages, model=args.model)
+        if ai_response:
+            handle_response(ai_response, messages, args.model)
+        return
+
+    # Interactive mode
     while True:
-        prompt = input("\nYou: ")
+        prompt = input("\nYou: ").strip()
         if prompt.lower() in ["exit", "quit"]:
+            if args.save_history:
+                save_history(messages)
             break
+        elif prompt == "/save":
+            save_history(messages)
+            continue
+        elif prompt == "/load":
+            loaded = load_history()
+            if loaded:
+                messages.extend(loaded)
+                print("Chat history loaded.")
+            continue
 
-        messages.append({"role": "user", "content": prompt})
+        user_content = prompt
+        if args.image:  # Image support in interactive mode via flag
+            base64_image = encode_image(args.image)
+            if base64_image:
+                user_content += "\n[Image attached.]"
+                messages.append({"role": "user", "content": user_content, "images": [base64_image]})
+                args.image = None  # Clear after use
+            else:
+                messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": user_content})
 
         print("\nAI: ", end="")
         ai_response = call_ollama_api_stream(messages, model=args.model)
         if ai_response:
             messages.append({"role": "assistant", "content": ai_response})
+            handle_response(ai_response, messages, args.model)
 
-            filename, language, code = extract_code_block(ai_response)
+def handle_response(ai_response: str, messages: List[Dict], model: str):
+    """Handles code extraction, execution, and debugging."""
+    filename, language, code = extract_code_block(ai_response)
+    if not code:
+        return
 
-            if code:
-                if language == "bash" or not language:
-                    # ... (self-debugging loop for bash commands remains the same)
-                    while True:
-                        confirm = input(f"\nExecute the following command? [y/N]: \n{code}\n")
-                        if confirm.lower() == 'y':
-                            try:
-                                result = subprocess.run(code, shell=True, check=True, capture_output=True, text=True)
-                                print("\nCommand executed successfully.")
-                                print("Output:\n", result.stdout)
-                                break
-                            except subprocess.CalledProcessError as e:
-                                print(f"\nError executing command: {e}")
-                                print("Stderr:\n", e.stderr)
-                                debug_confirm = input("\nDo you want to try to debug this error? [y/N]: ")
-                                if debug_confirm.lower() == 'y':
-                                    debug_messages = messages + [
-                                        {
-                                            "role": "user",
-                                            "content": f"The previous command failed with the following error:\n{e.stderr}\n\nPlease provide a corrected command."
-                                        }
-                                    ]
-                                    print("\nAI: ", end="")
-                                    debug_response = call_ollama_api_stream(debug_messages, model=args.model)
-                                    if debug_response:
-                                        messages.append({"role": "assistant", "content": debug_response})
-                                        _, _, code = extract_code_block(debug_response)
-                                        if not code:
-                                            print("\nAI could not provide a fix.")
-                                            break
-                                else:
-                                    break
-                        else:
-                            break
-                else:
-                    if filename:
-                        os.makedirs(os.path.dirname(filename), exist_ok=True)
-                        with open(filename, "w") as f:
-                            f.write(code)
-                        print(f"\nCode saved to {filename}")
-                    else:
-                        filename = input(f"\nSave code as (e.g., my_code.{language}): ")
-                        if filename:
-                            with open(filename, "w") as f:
-                                f.write(code)
-                            print(f"\nCode saved to {filename}")
+    # Save code if applicable
+    if filename:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "w") as f:
+            f.write(code)
+        print(f"\nCode saved to {filename}")
+    else:
+        filename = input(f"\nSave code as (e.g., my_code.{language}): ").strip()
+        if filename:
+            with open(filename, "w") as f:
+                f.write(code)
+            print(f"\nCode saved to {filename}")
 
-                    if filename:
-                        run_confirm = input(f"\nDo you want to try to run this {language} code? [y/N]: ")
-                        if run_confirm.lower() == 'y':
-                            # ... (AI-powered run command logic remains the same)
-                            run_messages = [
-                                {
-                                    "role": "system",
-                                    "content": "You are an expert at running code in various languages. Given a filename and a language, provide the shell command to run the code."
-                                },
-                                {
-                                    "role": "user",
-                                    "content": f"How do I run the file '{filename}' which is written in {language}?"
-                                }
-                            ]
-                            print("\nAI: ", end="")
-                            run_command_response = call_ollama_api_stream(run_messages, model=args.model)
-                            if run_command_response:
-                                messages.append({"role": "assistant", "content": run_command_response})
-                                _, _, run_command = extract_code_block(run_command_response)
-                                if run_command:
-                                    # This is where the self-debugging loop for generated code would go
-                                    # For now, we'll just execute it once
-                                    confirm = input(f"\nExecute the following command? [y/N]: \n{run_command}\n")
-                                    if confirm.lower() == 'y':
-                                        try:
-                                            subprocess.run(run_command, shell=True, check=True)
-                                            print("\nCommand executed successfully.")
-                                        except subprocess.CalledProcessError as e:
-                                            print(f"\nError executing command: {e}")
+    if not filename:
+        return
+
+    # Run confirmation
+    run_confirm = input(f"\nRun this {language} code? [y/N]: ").strip().lower()
+    if run_confirm != 'y':
+        return
+
+    # Generate run command via AI
+    run_messages = [
+        {"role": "system", "content": "Provide a shell command to run the given file in the specified language."},
+        {"role": "user", "content": f"Command to run '{filename}' in {language}?"}
+    ]
+    print("\nGenerating run command: ", end="")
+    run_command_response = call_ollama_api_stream(run_messages, model=model)
+    if not run_command_response:
+        return
+
+    _, _, run_command = extract_code_block(run_command_response)
+    if not run_command:
+        print("\nNo valid run command generated.")
+        return
+
+    # Execution with debugging loop
+    while True:
+        confirm = input(f"\nExecute: '{run_command}'? [y/N]: ").strip().lower()
+        if confirm != 'y':
+            break
+        try:
+            result = subprocess.run(run_command, shell=True, check=True, capture_output=True, text=True)
+            print("\nSuccess! Output:\n", result.stdout)
+            break
+        except subprocess.CalledProcessError as e:
+            print(f"\nError: {e}\nStderr:\n{e.stderr}")
+            debug_confirm = input("\nDebug this error? [y/N]: ").strip().lower()
+            if debug_confirm != 'y':
+                break
+            debug_messages = messages + [{"role": "user", "content": f"Command failed: {e.stderr}\nProvide corrected command."}]
+            print("\nDebugging: ", end="")
+            debug_response = call_ollama_api_stream(debug_messages, model=model)
+            if debug_response:
+                messages.append({"role": "assistant", "content": debug_response})
+                _, _, run_command = extract_code_block(debug_response)
+                if not run_command:
+                    print("\nNo fix provided.")
+                    break
 
 if __name__ == "__main__":
     main()
